@@ -356,6 +356,31 @@ __device__ void arrive_cluster(uint64_t* bar, uint32_t cta_id, uint32_t count=1)
         : "r"(smem_addr), "r"(cta_id), "r"(count));
 }
 
+template<int BM, int BN, int B_WG_M, int WGMMA_M, int WGMMA_N>
+__device__ __forceinline__ void write_tile_tma(uint32_t base_addr, float *d, bf16* tma_src, void const* dst_tma_map, int m, int n, int tid, int wg_idx) {
+    if (m >= 0) {
+        bf16 d_bf16[8];
+        int4* data_ptr = (int4*)d_bf16;
+
+        for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+            for (int w = 0; w < WGMMA_N; w+=16, d += 8) {
+                uint32_t addr = base_addr + (w*B_WG_M + m_it*WGMMA_M) * sizeof(bf16);
+                for (int k = 0; k < 8; k++) {
+                    d_bf16[k] = (bf16)(d[k]);
+                }
+                asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared::cta.b16 [%0], {%1, %2, %3, %4};"
+                             :: "r"(addr), "r"(data_ptr[0].x), "r"(data_ptr[0].y), "r"(data_ptr[0].z), "r"(data_ptr[0].w));
+            }
+        }
+        asm volatile("bar.sync %0, 128;\n" ::"r"(wg_idx + 2) : "memory");
+
+        if (tid == 0) {
+            store_async(dst_tma_map, tma_src, m*BM + wg_idx*B_WG_M, n*BN);
+            asm volatile("cp.async.bulk.commit_group;");
+        }
+    }
+}
+
 template<int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule;
 
@@ -483,6 +508,16 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
         int p = 0;
         int qidx = 0;
         int num_block_m, num_block_n;
+
+        // stmatrix and wgmma layouts match for BF16:
+        // 1) 9.7.14.5.16 Warp-level matrix store instruction: stmatrix
+        // 2) Figure 148: WGMMA .m64nNk16 register fragment layout for accumulator matrix D
+        int lane = tid % 32, warp = tid / 32;
+        bf16* block_sC = sC + wg_idx*B_WG_M*BN;
+        uint32_t tid_offset = warp*16 + (lane % 8) * B_WG_M; // offset for x1 stmatrix
+        tid_offset += (lane/16)*B_WG_M*8 + (lane & 8); // row & column offsets for .x4 on stmatrix
+        uint32_t base_addr = static_cast<uint32_t>(__cvta_generic_to_shared(block_sC)) + tid_offset * sizeof(bf16);
+
         while (schedule.next(num_block_m, num_block_n)) {
             num_block_n = num_block_n * CLUSTER_N + rank_n;
             num_block_m = num_block_m * CLUSTER_M + rank_m;
@@ -542,44 +577,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
             }
 
             asm volatile("cp.async.bulk.wait_group 0;");
-
-            int lane = tid % 32, warp = tid / 32;
-            int row = warp*16 + lane / 4;
-
-            bf16* block_sC = sC + wg_idx*B_WG_M*BN;
-            #pragma unroll
-            for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
-                int yo = m_it*WGMMA_M;
-                #pragma unroll
-                for (int w = 0; w < WGMMA_N; w+=16) {
-                    int col = w + 2*(tid % 4);
-                    #define ST(i, j, v) block_sC[(j)*B_WG_M + (i) + yo] = v
-                    
-                    ST(row, col, d[m_it][w/16][0]);
-                    ST(row+8, col, d[m_it][w/16][2]);
-                    
-                    
-                    ST(row, col+1, d[m_it][w/16][1]);
-                    ST(row+8, col+1, d[m_it][w/16][3]);
-                    
-                    
-                    ST(row, col+8, d[m_it][w/16][4]);
-                    ST(row+8, col+8, d[m_it][w/16][6]);
-                    
-                    
-                    ST(row, col+9, d[m_it][w/16][5]);
-                    ST(row+8, col+9, d[m_it][w/16][7]);
-                    
-                    
-                    // #undef IDX
-                    #undef ST
-                }
-            }
-            asm volatile("bar.sync 10, 256;\n");
-            if (threadIdx.x == 128) {
-                store_async(&tensorMapC, (bf16*)&sC[0], num_block_m*BM, num_block_n*BN);
-                asm volatile("cp.async.bulk.commit_group;");
-            }
+            write_tile_tma<BM, BN, B_WG_M, WGMMA_M, WGMMA_N>(base_addr, (float*)d, block_sC, &tensorMapC, num_block_m, num_block_n, tid, wg_idx);
         }
     }
 }
@@ -593,12 +591,13 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     constexpr int CLUSTER_M = 2;
     constexpr int CLUSTER_N = 1;
     constexpr int NUM_SM = 128;
+    constexpr int NUM_CONSUMERS = (NUM_THREADS / 128) - 1;
     static_assert(NUM_SM % (CLUSTER_M*CLUSTER_N) == 0);
 
     if (_prev_m != M) {
         d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
         d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
-        d_tma_map_C = create_tensor_map<BN, BM, false>(C, N, M);
+        d_tma_map_C = create_tensor_map<BN, BM / NUM_CONSUMERS, false>(C, N, M);
         _prev_m = M;
         _prev_n = N;
         _prev_k = K;
